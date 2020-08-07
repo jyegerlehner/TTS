@@ -16,7 +16,7 @@ def load_checkpoint(model, checkpoint_path, use_cuda=False):
     return model, state
 
 
-def save_model(model, optimizer, current_step, epoch, r, output_path, amp_state_dict=None, **kwargs):
+def save_model(model, optimizer, current_step, epoch, r, output_path, **kwargs):
     new_state_dict = model.state_dict()
     state = {
         'model': new_state_dict,
@@ -26,8 +26,6 @@ def save_model(model, optimizer, current_step, epoch, r, output_path, amp_state_
         'date': datetime.date.today().strftime("%B %d, %Y"),
         'r': r
     }
-    if amp_state_dict:
-        state['amp'] = amp_state_dict
     state.update(kwargs)
     torch.save(state, output_path)
 

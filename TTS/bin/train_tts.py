@@ -35,7 +35,8 @@ from TTS.utils.radam import RAdam
 from TTS.utils.tensorboard_logger import TensorboardLogger
 from TTS.utils.training import (NoamLR, adam_weight_decay, check_update,
                                 gradual_training_scheduler, set_weight_decay,
-                                setup_torch_training_env)
+                                setup_torch_training_env, precision_option,
+                                check_amp_support)
 
 use_cuda, num_gpus = setup_torch_training_env(True, False)
 
@@ -117,7 +118,7 @@ def format_data(data):
 
 
 def train(model, criterion, optimizer, optimizer_st, scheduler,
-          ap, global_step, epoch, amp):
+          ap, global_step, epoch, amp_scaler):
     data_loader = setup_loader(ap, model.decoder.r, is_val=False,
                                verbose=(epoch == 0))
     model.train()
@@ -146,15 +147,17 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
         if optimizer_st:
             optimizer_st.zero_grad()
 
-        # forward pass model
-        if c.bidirectional_decoder or c.double_decoder_consistency:
-            decoder_output, postnet_output, alignments, stop_tokens, decoder_backward_output, alignments_backward = model(
-                text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids)
-        else:
-            decoder_output, postnet_output, alignments, stop_tokens = model(
-                text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids)
-            decoder_backward_output = None
-            alignments_backward = None
+        with precision_option(use_amp = amp_scaler is not None)():
+            # forward pass model
+            if c.bidirectional_decoder or c.double_decoder_consistency:
+                decoder_output, postnet_output, alignments, stop_tokens, decoder_backward_output, alignments_backward = model(
+                    text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids)
+            else:
+                decoder_output, postnet_output, alignments, stop_tokens = model(
+                    text_input, text_lengths, mel_input, mel_lengths, speaker_ids=speaker_ids)
+                decoder_backward_output = None
+                alignments_backward = None
+
 
         # set the alignment lengths wrt reduction factor for guided attention
         if mel_lengths.max() % model.decoder.r != 0:
@@ -170,19 +173,19 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
                               text_lengths)
 
         # backward pass
-        if amp is not None:
-            with amp.scale_loss( loss_dict['loss'], optimizer) as scaled_loss:
-                scaled_loss.backward()
+        if amp_scaler is not None:
+            amp_scaler.scale(loss_dict['loss']).backward()
         else:
             loss_dict['loss'].backward()
 
         optimizer, current_lr = adam_weight_decay(optimizer)
-        if amp:
-            amp_opt_params = amp.master_params(optimizer)
+        grad_norm, _ = check_update(model, c.grad_clip, optimizer, amp_scaler, ignore_stopnet=True)
+
+        if amp_scaler is not None:
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
         else:
-            amp_opt_params = None
-        grad_norm, _ = check_update(model, c.grad_clip, ignore_stopnet=True, amp_opt_params=amp_opt_params)
-        optimizer.step()
+            optimizer.step()
 
         # compute alignment error (the lower the better )
         align_error = 1 - alignment_diagonal_score(alignments)
@@ -190,14 +193,18 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
 
         # backpass and check the grad norm for stop loss
         if c.separate_stopnet:
-            loss_dict['stopnet_loss'].backward()
-            optimizer_st, _ = adam_weight_decay(optimizer_st)
-            if amp:
-                amp_opt_params = amp.master_params(optimizer)
+            if amp_scaler is not None:
+                amp_scaler.scale(loss_dict['stopnet_loss']).backward()
             else:
-                amp_opt_params = None
-            grad_norm_st, _ = check_update(model.decoder.stopnet, 1.0, amp_opt_params=amp_opt_params)
-            optimizer_st.step()
+                loss_dict['stopnet_loss'].backward()
+            optimizer_st, _ = adam_weight_decay(optimizer_st)
+            grad_norm_st, _ = check_update(model.decoder.stopnet, 1.0, optimizer, amp_scaler)
+
+            if amp_scaler is not None:
+                amp_scaler.step(optimizer_st)
+                amp_scaler.update()
+            else:
+                optimizer_st.step()
         else:
             grad_norm_st = 0
 
@@ -258,8 +265,7 @@ def train(model, criterion, optimizer, optimizer_st, scheduler,
                     # save model
                     save_checkpoint(model, optimizer, global_step, epoch, model.decoder.r, OUT_PATH,
                                     optimizer_st=optimizer_st,
-                                    model_loss=loss_dict['postnet_loss'],
-                                    amp_state_dict=amp.state_dict() if amp else None)
+                                    model_loss=loss_dict['postnet_loss'])
 
                 # Diagnostic visualizations
                 const_spec = postnet_output[0].data.cpu().numpy()
@@ -511,13 +517,14 @@ def main(args):  # pylint: disable=redefined-outer-name
     else:
         optimizer_st = None
 
-    if c.apex_amp_level == "O1":
+    print("use amp == {}".format(c.use_amp))
+    if c.use_amp:
+        check_amp_support()
         # pylint: disable=import-outside-toplevel
-        from apex import amp
         model.cuda()
-        model, optimizer = amp.initialize(model, optimizer, opt_level=c.apex_amp_level)
+        amp_scaler = torch.cuda.amp.GradScaler()
     else:
-        amp = None
+        amp_scaler = None
 
     # setup criterion
     criterion = TacotronLoss(c, stopnet_pos_weight=10.0, ga_sigma=0.4)
@@ -537,9 +544,6 @@ def main(args):  # pylint: disable=redefined-outer-name
             model_dict = set_init_dict(model_dict, checkpoint['model'], c)
             model.load_state_dict(model_dict)
             del model_dict
-
-        if amp and 'amp' in checkpoint:
-            amp.load_state_dict(checkpoint['amp'])
 
         for group in optimizer.param_groups:
             group['lr'] = c.lr
@@ -583,14 +587,14 @@ def main(args):  # pylint: disable=redefined-outer-name
             print("\n > Number of output frames:", model.decoder.r)
         train_avg_loss_dict, global_step = train(model, criterion, optimizer,
                                                  optimizer_st, scheduler, ap,
-                                                 global_step, epoch, amp)
+                                                 global_step, epoch, amp_scaler)
         eval_avg_loss_dict = evaluate(model, criterion, ap, global_step, epoch)
         c_logger.print_epoch_end(epoch, eval_avg_loss_dict)
         target_loss = train_avg_loss_dict['avg_postnet_loss']
         if c.run_eval:
             target_loss = eval_avg_loss_dict['avg_postnet_loss']
         best_loss = save_best_model(target_loss, best_loss, model, optimizer, global_step, epoch, c.r,
-                                    OUT_PATH, amp_state_dict=amp.state_dict() if amp else None)
+                                    OUT_PATH)
 
 
 if __name__ == '__main__':
@@ -642,8 +646,7 @@ if __name__ == '__main__':
     check_config(c)
     _ = os.path.dirname(os.path.realpath(__file__))
 
-    if c.apex_amp_level == 'O1':
-        print("   >  apex AMP level: ", c.apex_amp_level)
+    print("Using AMP: {}".format(c.use_amp))
 
     OUT_PATH = args.continue_path
     if args.continue_path == '':

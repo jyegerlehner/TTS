@@ -13,20 +13,18 @@ def setup_torch_training_env(cudnn_enable, cudnn_benchmark):
     return use_cuda, num_gpus
 
 
-def check_update(model, grad_clip, ignore_stopnet=False, amp_opt_params=None):
+def check_update(model, grad_clip, optimizer, amp_scaler, ignore_stopnet=False):
     r'''Check model gradient against unexpected jumps and failures'''
     skip_flag = False
+
+    # Unscale gradients before clipping if we are using mixed precision.
+    if amp_scaler is not None:
+        amp_scaler.unscale_(optimizer)
     if ignore_stopnet:
-        if not amp_opt_params:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [param for name, param in model.named_parameters() if 'stopnet' not in name], grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(amp_opt_params, grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [param for name, param in model.named_parameters() if 'stopnet' not in name], grad_clip)
     else:
-        if not amp_opt_params:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(amp_opt_params, grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     # compatibility with different torch versions
     if isinstance(grad_norm, float):
@@ -114,3 +112,35 @@ def gradual_training_scheduler(global_step, config):
         if global_step * num_gpus >= values[0]:
             new_values = values
     return new_values[1], new_values[2]
+
+
+class UniformPrecisionContextMgr(object):
+    def __init__(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return exc_value is None
+
+
+def precision_option(use_amp):
+    if use_amp:
+        # pylint: disable=import-outside-toplevel
+        from torch.cuda.amp import autocast
+        # Using mixed precision.
+        return autocast
+    else:
+        # Not using amp, so there is no mixed precision.
+        return UniformPrecisionContextMgr
+
+# Runtime check to see if torch version supports AMP.
+def check_amp_support():
+    # pylint: disable=import-outside-toplevel
+    from packaging import version
+    if version.parse(torch.__version__) < version.parse('1.6.0'):
+        raise RuntimeError('AMP requires torch 1.6.0 or greater. {} found.'\
+        .format(torch.__version__))
+
+
